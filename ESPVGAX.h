@@ -131,6 +131,14 @@ public:
   static uint32_t rand();
   static void srand(uint32_t seed);
   /*
+   * uart_available()
+   * uart_read()
+   *    Replacement for Serial.available() and Serial.read() when synchronous
+   *    polling is enabled.
+   */
+  static int uart_available();
+  static int uart_read();
+  /*
    * clear(c8)
    *    fast clear of VGA framebuffer. c8 parameter is used to fill 8 pixels 
    *    with cleared value. For example 0xff will turn 8 pixel on, 0xf0 will 
@@ -509,6 +517,12 @@ public:
    *      the number of pixels in a line!
    */
   static volatile uint8_t *fbb;
+
+  #define ESPVGAX_UART_RX_BUF_SIZE 256
+  static volatile uint8_t uart_rx_buf[ESPVGAX_UART_RX_BUF_SIZE];
+  static volatile uint16_t uart_rx_head;
+  static volatile uint16_t uart_rx_tail;
+
   /*
    * tone(uint8_t t)
    * noTone()
