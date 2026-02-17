@@ -1,6 +1,9 @@
 #include "ESPVGAX.h"
 
 volatile uint32_t ESPVGAX_ALIGN32 ESPVGAX::fbw[ESPVGAX_HEIGHT][ESPVGAX_WWIDTH];
+volatile uint8_t ESPVGAX::uart_rx_buf[ESPVGAX_UART_RX_BUF_SIZE];
+volatile uint16_t ESPVGAX::uart_rx_head = 0;
+volatile uint16_t ESPVGAX::uart_rx_tail = 0;
 
 static volatile uint32_t ESPVGAX_ALIGN32 empty[ESPVGAX_WWIDTH];
 static volatile uint32_t *line;
@@ -9,10 +12,17 @@ static volatile int vsync;
 static volatile int running;
 
 #ifdef ESPVGAX_EXTRA_COLORS
-volatile uint8_t props[525];
+volatile uint8_t props[ESPVGAX_HEIGHT + 45];
 #endif
 
 volatile uint8_t *ESPVGAX::fbb=(volatile uint8_t*)&ESPVGAX::fbw[0];
+
+#define UART_FIFO(i)            (0x60000000 + (i)*0x100)
+#define UART_INT_ENA(i)         (0x60000000 + (i)*0x100 + 0x0C)
+#define UART_STATUS(i)          (0x60000000 + (i)*0x100 + 0x1C)
+#define UART_RXFIFO_CNT         0x000000FF
+#define UART_RXFIFO_FULL_INT_ENA (BIT(0))
+#define UART_RXFIFO_TOUT_INT_ENA (BIT(8))
 
 #include "espvgax_hspi.h"
 
@@ -37,71 +47,90 @@ static inline uint32_t getTicks() {
 void ICACHE_RAM_ATTR vga_handler() {
   noInterrupts();
 #if ESPVGAX_TIMER==0
-  // timer0 need to be scheduled again
-  timer0_write(TICKS+16*US_TO_RTC_TIMER_TICKS(32));
+  // timer0 needs to be scheduled again immediately
+  timer0_write(TICKS + 16 * US_TO_RTC_TIMER_TICKS(32));
 #endif
-  // begin negative HSYNC
-  GPOC=1<<ESPVGAX_HSYNC_PIN;
+
+  // --- BEGIN NEGATIVE HSYNC ---
+  GPOC = 1 << ESPVGAX_HSYNC_PIN;
+
+  // Determine if this is a visible line or blanking line
+  bool is_visible = (fby < ESPVGAX_HEIGHT) && running;
+
 #ifdef ESPVGAX_EXTRA_COLORS
-  uint8_t pr=props[fby];
-  if (pr & ESPVGAX_PROP_COLOR1) 
-    GP16O |= 1;
-  else
-    GP16O &= ~1;
-  if (pr & ESPVGAX_PROP_COLOR2)
-    GPOS=1<<ESPVGAX_EXTRA_COLOR2_PIN;
-  else
-    GPOC=1<<ESPVGAX_EXTRA_COLOR2_PIN; 
-#if F_CPU==80000000L
-  NOP_DELAY(100); // 2us*80MHz (- 60clock becouse extra colors require time)
-#else
-  NOP_DELAY(400); // should be 320 (2us*160MHz) but 400 works well
-#endif  
-#else // ESPVGAX_EXTRA_COLORS not defined
-#if F_CPU==80000000L
-  NOP_DELAY(160); // 2us*80MHz
-#else
-  NOP_DELAY(480); // should be 320 (2us*160MHz) but 480 works well
-#endif  
+  if (fby >= 0 && fby < (ESPVGAX_HEIGHT + 45)) {
+    uint8_t pr = props[fby];
+    if (pr & ESPVGAX_PROP_COLOR1) GP16O |= 1;
+    else GP16O &= ~1;
+
+    if (pr & ESPVGAX_PROP_COLOR2) GPOS = 1 << ESPVGAX_EXTRA_COLOR2_PIN;
+    else GPOC = 1 << ESPVGAX_EXTRA_COLOR2_PIN;
+  }
 #endif
-  // end negative HSYNC
-  GPOS=1<<ESPVGAX_HSYNC_PIN;
-  // begin or end VSYNC, depending of value of vsync variable
-  ESP8266_REG(vsync)=1<<ESPVGAX_VSYNC_PIN;
-  //write PIXELDATA
-  if (running) {
+
+  // Prepare SPI/DMA FIFO during HSYNC low window
+  if (is_visible) {
     HSPI_VGA_prepare();
+  }
+
+  // HSYNC Pulse Width Delay
+#if F_CPU==80000000L
+  NOP_DELAY(is_visible ? 50 : 80);
+#else
+  NOP_DELAY(is_visible ? 200 : 300);
+#endif
+
+  // --- END NEGATIVE HSYNC ---
+  GPOS = 1 << ESPVGAX_HSYNC_PIN;
+
+  // Pulse VSYNC based on signal state
+  ESP8266_REG(vsync) = 1 << ESPVGAX_VSYNC_PIN;
+
+  if (is_visible) {
+    // START PIXELDATA transfer for visible lines
     HSPI_VGA_send();
+
+    // Update line pointer for next cycle while current line is being shifted out
+    fby++;
+    line = (fby < ESPVGAX_HEIGHT) ? ESPVGAX::fbw[fby] : empty;
+  } else {
+    // --- OPTIMIZATION FOR BLANKING LINES ---
+    // Instead of calling send() for 'empty' data and blocking the CPU,
+    // we just update state and exit early to let UART interrupts fire.
+
+    fby++;
+    // Handle VSYNC state transitions
+    switch (fby) {
+      case 525:
+        fby = 0;
+        break;
+      case 490:
+        vsync = 0x308; // Begin negative VSYNC
+        break;
+      case 492:
+        vsync = 0x304; // End negative VSYNC
+        break;
+    }
+
+    line = (fby < ESPVGAX_HEIGHT) ? ESPVGAX::fbw[fby] : empty;
   }
-  // prepare for the next vga_handler run
-  fby++;
-  switch (fby) {
-  case 525: 
-    // restart from the beginning
-    fby=0; 
-    break;
-  case 490: 
-    // next line will begin negative VSYNC 
-    vsync=0x308; 
-    break;
-  case 492: 
-    // next line will end negative VSYNC
-    vsync=0x304; 
-    break;
+
+  // Poll UART0 FIFO before re-enabling interrupts
+  uint32_t uart_status = READ_PERI_REG(UART_STATUS(0));
+  uint16_t rx_cnt = uart_status & 0xFF; // UART_RXFIFO_CNT is bits 0-7
+  while (rx_cnt--) {
+    uint8_t c = READ_PERI_REG(UART_FIFO(0)) & 0xFF;
+    uint16_t next_head = (ESPVGAX::uart_rx_head + 1) % ESPVGAX_UART_RX_BUF_SIZE;
+    if (next_head != ESPVGAX::uart_rx_tail) {
+      ESPVGAX::uart_rx_buf[ESPVGAX::uart_rx_head] = c;
+      ESPVGAX::uart_rx_head = next_head;
+    }
   }
-  // fetch the next line, or empty line in case of VGA lines [480..524]
-  line=(fby<ESPVGAX_HEIGHT) ? ESPVGAX::fbw[fby] : empty;
+
   interrupts();
-  /* 
-   * feed the dog. keep ESP8266 WATCHDOG awake. VGA signal generation works 
-   * well if there are ZERO calls to Arduino functions like delay or yield. 
-   * These functions will perform many background tasks that generates some
-   * delays on the VGA signal stability but keeps the hardware WATCHDOG awake. 
-   * I have not figured out why this happen, probably there are some hardware
-   * task that generate a jitter in the interrupt callback, like on ATMEGA MCU,
-   * see the VGAX dejitter nightmare
-   */
-  ESP.wdtFeed(); 
+
+  // Keep watchdog alive
+  ESP.wdtFeed();
 }
 void ESPVGAX::begin() {
   pinMode(ESPVGAX_VSYNC_PIN, OUTPUT);
@@ -119,6 +148,8 @@ void ESPVGAX::begin() {
   running=1;
   // setup HSPI to output PIXELDATA on D7 PIN 
   HSPI_VGA_init();
+  // Disable UART RX interrupts to prevent jitter
+  CLEAR_PERI_REG_MASK(UART_INT_ENA(0), UART_RXFIFO_FULL_INT_ENA | UART_RXFIFO_TOUT_INT_ENA);
   // install vga_handler interrupt
   noInterrupts();
 #if ESPVGAX_TIMER==0
@@ -148,6 +179,15 @@ void ESPVGAX::end() {
   timer1_detachInterrupt();
 #endif
   interrupts();
+}
+int ESPVGAX::uart_available() {
+  return (ESPVGAX_UART_RX_BUF_SIZE + uart_rx_head - uart_rx_tail) % ESPVGAX_UART_RX_BUF_SIZE;
+}
+int ESPVGAX::uart_read() {
+  if (uart_rx_head == uart_rx_tail) return -1;
+  uint8_t c = uart_rx_buf[uart_rx_tail];
+  uart_rx_tail = (uart_rx_tail + 1) % ESPVGAX_UART_RX_BUF_SIZE;
+  return c;
 }
 void ICACHE_RAM_ATTR ESPVGAX::delay(uint32_t msec) {
   // predict the CPU ticks to be awaited
